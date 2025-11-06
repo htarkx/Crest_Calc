@@ -131,30 +131,7 @@ rms_values = np.sqrt(np.mean(windowed_data**2, axis=1)) # Vectorized RMS
 crest_factors = 20 * np.log10(peaks / rms_values)       # Vectorized CF
 ```
 
-## 📋 Professional Applications
 
-### Audio Mastering
-- **Dynamic Range Assessment**: Identify over-compressed sections
-- **True Peak Compliance**: Ensure broadcast-safe levels
-- **Loudness Standards**: Meet streaming platform requirements
-
-### Broadcast Engineering
-- **EBU R128 Compliance**: Integrated and short-term loudness
-- **Peak Level Monitoring**: True Peak vs Sample Peak analysis
-- **Dynamic Range Monitoring**: Real-time audio quality assessment
-
-### Audio Quality Control
-- **Compression Detection**: Identify over-limited audio
-- **Dynamic Range Analysis**: Assess musical dynamics
-- **Format Validation**: Ensure proper audio levels
-
-## 🔧 Advanced Configuration
-
-### FFmpeg Integration
-The tool automatically detects and uses FFmpeg for authoritative audio analysis:
-- **EBU R128 Loudness**: Industry-standard loudness measurement
-- **True Peak Detection**: Reconstruction filtering for accurate peak detection
-- **LRA Analysis**: Loudness Range Assessment for dynamic content
 
 ### Performance Tuning
 ```python
@@ -168,43 +145,8 @@ else:
     use_parallel_processing()
 ```
 
-### Error Handling
-- **Graceful Degradation**: Falls back to Python implementation if FFmpeg unavailable
-- **Comprehensive Logging**: Detailed error reporting and warnings
-- **Format Validation**: Automatic audio format detection and handling
 
-## 📚 Technical Specifications
 
-### Supported Audio Formats
-- **Lossless**: FLAC, WAV, AIFF, ALAC
-- **Lossy**: MP3, AAC, OGG, Opus
-- **High-Resolution**: Up to 384kHz/32-bit
-- **Multi-channel**: Up to 7.1 surround
-
-### Analysis Parameters
-- **Window Size**: 50ms (configurable)
-- **Hop Size**: 12.5ms (75% overlap)
-- **True Peak Oversampling**: 4x (FFmpeg standard)
-- **LUFS Standard**: EBU R128/ITU-R BS.1770
-
-### Performance Characteristics
-- **Memory Usage**: Streaming analysis for large files
-- **CPU Utilization**: Multi-threaded parallel processing
-- **I/O Efficiency**: Optimized file reading and processing
-- **Scalability**: Linear scaling with CPU cores
-
-## 🎯 Industry Standards Compliance
-
-### Broadcast Standards
-- **EBU R128**: European Broadcasting Union loudness standard
-- **ITU-R BS.1770**: International Telecommunication Union standard
-- **ATSC A/85**: Advanced Television Systems Committee standard
-
-### Streaming Platform Requirements
-- **Spotify**: -14 LUFS integrated loudness
-- **Apple Music**: -16 LUFS integrated loudness
-- **YouTube**: -14 LUFS integrated loudness
-- **Netflix**: -27 LUFS integrated loudness
 
 ## 🔍 Troubleshooting
 
@@ -219,31 +161,3 @@ ffprobe audio_file.wav
 # Test with simple mode
 python crest.py audio_file.wav --simple
 ```
-
-### Performance Optimization
-- **Large Files**: Use streaming analysis for files >1GB
-- **High Sample Rates**: Consider downsampling for analysis
-- **Batch Processing**: Process multiple files in parallel
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 🤝 Contributing
-
-We welcome contributions from the audio engineering community:
-- **Bug Reports**: Use GitHub Issues
-- **Feature Requests**: Submit detailed proposals
-- **Code Contributions**: Follow our coding standards
-- **Documentation**: Help improve our documentation
-
-## 📞 Support
-
-For professional support and custom implementations:
-- **GitHub Issues**: Technical support and bug reports
-- **Documentation**: Comprehensive guides and examples
-- **Community**: Audio engineering discussions and best practices
-
----
-
-**Built for professionals, by professionals.** 🎵⚡
