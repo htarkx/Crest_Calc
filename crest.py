@@ -705,20 +705,49 @@ def _safe_int(x):
     except Exception:
         return None
 
+def _jsonify(x):
+    if x is None:
+        return None
+    if np is not None and isinstance(x, np.generic):
+        return x.item()
+    if isinstance(x, (str, int, float, bool)):
+        return x
+    if isinstance(x, Path):
+        return str(x)
+    if isinstance(x, dict):
+        return {str(k): _jsonify(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonify(v) for v in x]
+    return str(x)
+
+def _fmt_num(value, fmt):
+    if value is None:
+        return None
+    try:
+        return format(float(value), fmt)
+    except Exception:
+        return None
+
+def _fmt_db(value, unit, fmt=".2f"):
+    s = _fmt_num(value, fmt)
+    return f"{s} {unit}" if s is not None else None
+
 def write_album_summary_csv(directory, rows, output_name="crest_album_summary.csv"):
     raise RuntimeError("CSV summary is deprecated; use write_album_summary_json() instead.")
 
 def write_album_summary_json(directory, rows, output_name="crest_album_summary.json"):
     out_path = Path(directory) / output_name
-    payload = {
+    payload = _jsonify(
+        {
         "schema": "crest_calc_album_summary_v1",
         "generated_by": "crest.py",
         "directory": str(Path(directory)),
         "file_count": int(len(rows)),
         "rows": rows,
-    }
+        }
+    )
     with out_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2, allow_nan=False)
         f.write("\n")
     return str(out_path)
 
@@ -768,19 +797,26 @@ def analyze_album(
                     {
                         "file": file_path,
                         "status": "ok",
-                        "error": "",
-                        "duration_s": "",
-                        "sample_rate_hz": "",
-                        "channels": "",
-                        "sample_peak_dbfs": lin2dbfs(peak),
-                        "true_peak_dbfs": "",
-                        "sample_crest_db": crest_db,
-                        "true_crest_db": "",
-                        "pmf_dr": "",
-                        "pmf_dr_db": "",
-                        "pmf_dr_peak_source": "",
-                        "integrated_lufs": "",
-                        "lra_lu": "",
+                        "error": None,
+                        "duration_s": None,
+                        "sample_rate_hz": None,
+                        "channels": None,
+                        "sample_peak_dbfs": _safe_float(lin2dbfs(peak)),
+                        "sample_peak_dbfs_text": _fmt_db(lin2dbfs(peak), "dBFS", fmt=".2f"),
+                        "true_peak_dbfs": None,
+                        "true_peak_dbfs_text": None,
+                        "sample_crest_db": _safe_float(crest_db),
+                        "sample_crest_db_text": _fmt_db(crest_db, "dB", fmt=".2f"),
+                        "true_crest_db": None,
+                        "true_crest_db_text": None,
+                        "pmf_dr": None,
+                        "pmf_dr_db": None,
+                        "pmf_dr_db_text": None,
+                        "pmf_dr_peak_source": None,
+                        "integrated_lufs": None,
+                        "integrated_lufs_text": None,
+                        "lra_lu": None,
+                        "lra_lu_text": None,
                     }
                 )
                 continue
@@ -809,24 +845,40 @@ def analyze_album(
 
             lufs = results.get("lufs_analysis") or {}
             dr = results.get("pmf_dr") or {}
+            sample_peak_dbfs = _safe_float(lin2dbfs(results.get("sample_peak"))) if results.get("sample_peak") is not None else None
+            true_peak_dbfs = _safe_float(results.get("true_peak_dbfs")) if results.get("true_peak_dbfs") is not None else None
+            sample_crest_db = _safe_float(results.get("sample_crest_db")) if results.get("sample_crest_db") is not None else None
+            true_crest_db = _safe_float(results.get("true_crest_db")) if results.get("true_crest_db") is not None else None
+            pmf_dr_value = _safe_int(dr.get("dr_value")) if dr.get("dr_value") is not None else None
+            pmf_dr_db = _safe_float(dr.get("dr_db")) if dr.get("dr_db") is not None else None
+            integrated_lufs = _safe_float(lufs.get("integrated_lufs")) if lufs.get("integrated_lufs") is not None else None
+            lra_lu = _safe_float(lufs.get("loudness_range")) if lufs.get("loudness_range") is not None else None
 
             summary_rows.append(
                 {
                     "file": file_path,
                     "status": "ok",
-                    "error": "",
+                    "error": None,
                     "duration_s": _safe_float(results.get("duration")),
                     "sample_rate_hz": _safe_int(results.get("sample_rate")),
                     "channels": _safe_int(results.get("channels")),
-                    "sample_peak_dbfs": lin2dbfs(results.get("sample_peak")) if results.get("sample_peak") is not None else "",
-                    "true_peak_dbfs": results.get("true_peak_dbfs") if results.get("true_peak_dbfs") is not None else "",
-                    "sample_crest_db": results.get("sample_crest_db") if results.get("sample_crest_db") is not None else "",
-                    "true_crest_db": results.get("true_crest_db") if results.get("true_crest_db") is not None else "",
-                    "pmf_dr": dr.get("dr_value") if dr.get("dr_value") is not None else "",
-                    "pmf_dr_db": dr.get("dr_db") if dr.get("dr_db") is not None else "",
-                    "pmf_dr_peak_source": results.get("pmf_dr_peak_source") if results.get("pmf_dr_peak_source") is not None else "",
-                    "integrated_lufs": lufs.get("integrated_lufs") if lufs.get("integrated_lufs") is not None else "",
-                    "lra_lu": lufs.get("loudness_range") if lufs.get("loudness_range") is not None else "",
+                    "sample_peak_dbfs": sample_peak_dbfs,
+                    "sample_peak_dbfs_text": _fmt_db(sample_peak_dbfs, "dBFS", fmt=".2f"),
+                    "true_peak_dbfs": true_peak_dbfs,
+                    "true_peak_dbfs_text": _fmt_db(true_peak_dbfs, "dBFS", fmt=".2f"),
+                    "sample_crest_db": sample_crest_db,
+                    "sample_crest_db_text": _fmt_db(sample_crest_db, "dB", fmt=".2f"),
+                    "true_crest_db": true_crest_db,
+                    "true_crest_db_text": _fmt_db(true_crest_db, "dB", fmt=".2f"),
+                    "pmf_dr": (f"DR{pmf_dr_value}" if pmf_dr_value is not None else None),
+                    "pmf_dr_value": pmf_dr_value,
+                    "pmf_dr_db": pmf_dr_db,
+                    "pmf_dr_db_text": _fmt_db(pmf_dr_db, "dB", fmt=".2f"),
+                    "pmf_dr_peak_source": results.get("pmf_dr_peak_source") if results.get("pmf_dr_peak_source") is not None else None,
+                    "integrated_lufs": integrated_lufs,
+                    "integrated_lufs_text": (_fmt_db(integrated_lufs, "LUFS", fmt=".1f") if integrated_lufs is not None else None),
+                    "lra_lu": lra_lu,
+                    "lra_lu_text": (_fmt_db(lra_lu, "LU", fmt=".1f") if lra_lu is not None else None),
                 }
             )
         except Exception as e:
@@ -915,6 +967,10 @@ if __name__ == "__main__":
     show_benchmark = "--benchmark" in sys.argv
 
     if album_dir:
+        # Default album mode to PMF DR MkII unless explicitly overridden.
+        if not enable_pmf_dr:
+            enable_pmf_dr = True
+            pmf_dr_use_true_peak = True
         if show_benchmark:
             print("Note: --benchmark is ignored when using --album")
 
