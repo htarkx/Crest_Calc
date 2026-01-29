@@ -8,7 +8,8 @@ A high-performance, production-ready audio analysis tool for professional audio 
 - **Crest Factor Analysis**: Sample Peak, True Peak, and windowed analysis
 - **LUFS Loudness Measurement**: EBU R128/ITU-R BS.1770 compliant
 - **True Peak Detection**: Industry-standard reconstruction filtering
-- **Dynamic Range Analysis**: Short-term windowed analysis with statistical metrics
+- **PMF Dynamic Range (DR)**: TT DR-style `DR = Peak - (Top 20% RMS)` with Sample Peak or True Peak
+- **Dynamic Range Analysis**: Short-term windowed crest statistics (not TT DR)
 - **Multi-channel Support**: Proper power-based channel mixing
 
 ### High-Performance Architecture
@@ -65,6 +66,10 @@ python crest.py --check-deps
 # Disable specific analysis modules
 python crest.py audio_file.wav --no-true-peak --no-windowed --no-lufs
 
+# PMF Dynamic Range (TT DR-style)
+python crest.py audio_file.wav --pmf-dr          # Sample Peak
+python crest.py audio_file.wav --pmf-dr-mk2      # True Peak (requires FFmpeg for True Peak)
+
 # Disable parallel processing
 python crest.py audio_file.wav --no-parallel
 
@@ -91,6 +96,10 @@ Duration: 3.45 seconds
 🎯 Crest Factor:
   Sample CF  : 12.47 dB
   True CF    : 12.78 dB
+
+📏 PMF Dynamic Range (TT DR-style):
+  DR         : DR8 (7.62 dB) [True Peak]
+  Window     : 3.0s blocks, top 20% RMS
 
 🔍 Short-term Window Analysis (50ms windows):
   Mean CF    : 11.23 dB

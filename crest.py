@@ -216,6 +216,71 @@ def convert_dbfs_to_linear(dbfs_value):
         return None
     return 10 ** (dbfs_value / 20)
 
+def calculate_pmf_dr(data, samplerate, peak_linear, block_seconds=3.0, top_fraction=0.2, rounding="nearest"):
+    """
+    Calculate PMF Dynamic Range (DR) in the style of the TT DR Meter:
+      DR = Peak(dBFS) - RMS_top20%(dBFS)  == 20*log10(peak / rms_top20)
+
+    Notes:
+    - Audio is segmented into ~3s blocks; the loudest 20% (by RMS) are averaged.
+    - For multi-channel audio, RMS uses a power-average across channels per sample.
+    - `peak_linear` should be a linear amplitude (sample peak or true peak).
+    """
+    if data is None or samplerate is None or samplerate <= 0:
+        return None
+    if peak_linear is None or peak_linear <= 0:
+        return None
+
+    if data.ndim == 1:
+        data = data.reshape(-1, 1)
+    elif data.ndim != 2:
+        return None
+
+    block_len = int(round(block_seconds * samplerate))
+    if block_len <= 0:
+        return None
+
+    total_samples = data.shape[0]
+    num_blocks = total_samples // block_len
+    if num_blocks <= 0:
+        return None
+
+    trimmed = data[: num_blocks * block_len, :]
+    blocks = trimmed.reshape(num_blocks, block_len, data.shape[1])
+
+    power_per_sample = np.mean(blocks ** 2, axis=2)
+    mean_power_per_block = np.mean(power_per_sample, axis=1)
+    rms_per_block = np.sqrt(mean_power_per_block)
+
+    valid = rms_per_block > 0
+    if not np.any(valid):
+        return None
+    rms_per_block = rms_per_block[valid]
+
+    count = int(np.ceil(top_fraction * len(rms_per_block)))
+    count = max(1, min(count, len(rms_per_block)))
+    top_rms = np.sort(rms_per_block)[-count:]
+    top_rms_mean = float(np.mean(top_rms))
+    if top_rms_mean <= 0:
+        return None
+
+    dr_db = float(20.0 * np.log10(peak_linear / top_rms_mean))
+    if rounding == "floor":
+        dr_value = int(np.floor(dr_db + 1e-12))
+    elif rounding == "ceil":
+        dr_value = int(np.ceil(dr_db - 1e-12))
+    else:
+        dr_value = int(np.round(dr_db))
+
+    return {
+        "dr_db": dr_db,
+        "dr_value": dr_value,
+        "block_seconds": float(block_seconds),
+        "top_fraction": float(top_fraction),
+        "top_rms_mean": top_rms_mean,
+        "num_blocks": int(num_blocks),
+    }
+
 def _analysis_task_windowed(data, samplerate):
     """Short-term window analysis task (for parallelization)"""
     try:
@@ -238,7 +303,18 @@ def _analysis_task_ffmpeg(file_path):
     """FFmpeg analysis task (for parallelization)"""
     return ffmpeg_audio_analysis(file_path)
 
-def advanced_crest_analysis(file_path, enable_true_peak=True, enable_windowed=True, enable_lufs=True, use_parallel=True):
+def advanced_crest_analysis(
+    file_path,
+    enable_true_peak=True,
+    enable_windowed=True,
+    enable_lufs=True,
+    enable_pmf_dr=False,
+    pmf_dr_use_true_peak=False,
+    pmf_dr_block_seconds=3.0,
+    pmf_dr_top_fraction=0.2,
+    pmf_dr_rounding="nearest",
+    use_parallel=True,
+):
     """Advanced Crest Factor analysis - FFmpeg + vectorized optimization version"""
     try:
         # Force read as 2D array to preserve multi-channel information
@@ -332,7 +408,32 @@ def advanced_crest_analysis(file_path, enable_true_peak=True, enable_windowed=Tr
         true_crest_db = None
         if true_peak is not None:
             true_crest_db = 20 * np.log10(true_peak / rms)
-        
+
+        # PMF Dynamic Range (DR) calculation (TT DR-style)
+        pmf_dr = None
+        pmf_dr_peak_source = None
+        if enable_pmf_dr:
+            dr_peak_linear = None
+            if pmf_dr_use_true_peak:
+                if true_peak is not None:
+                    dr_peak_linear = true_peak
+                    pmf_dr_peak_source = "true_peak"
+                else:
+                    dr_peak_linear = sample_peak
+                    pmf_dr_peak_source = "sample_peak_fallback"
+            else:
+                dr_peak_linear = sample_peak
+                pmf_dr_peak_source = "sample_peak"
+
+            pmf_dr = calculate_pmf_dr(
+                data,
+                samplerate,
+                dr_peak_linear,
+                block_seconds=pmf_dr_block_seconds,
+                top_fraction=pmf_dr_top_fraction,
+                rounding=pmf_dr_rounding,
+            )
+
         return {
             'file_path': file_path,
             'sample_rate': samplerate,
@@ -344,6 +445,8 @@ def advanced_crest_analysis(file_path, enable_true_peak=True, enable_windowed=Tr
             'rms': rms,
             'sample_crest_db': sample_crest_db,
             'true_crest_db': true_crest_db,
+            'pmf_dr': pmf_dr,
+            'pmf_dr_peak_source': pmf_dr_peak_source,
             'windowed_analysis': windowed_analysis,
             'lufs_analysis': lufs_analysis,
             'ffmpeg_available': FFMPEG_AVAILABLE
@@ -385,7 +488,20 @@ def print_analysis_results(results):
     print(f"  Sample CF  : {results['sample_crest_db']:.2f} dB")
     if results['true_crest_db'] is not None:
         print(f"  True CF    : {results['true_crest_db']:.2f} dB")
-    
+
+    # PMF Dynamic Range (DR)
+    if results.get('pmf_dr') is not None:
+        dr = results['pmf_dr']
+        peak_src = results.get('pmf_dr_peak_source', 'unknown')
+        src_label = {
+            'true_peak': 'True Peak',
+            'sample_peak': 'Sample Peak',
+            'sample_peak_fallback': 'Sample Peak (True Peak unavailable)',
+        }.get(peak_src, peak_src)
+        print(f"\n📏 PMF Dynamic Range (TT DR-style):")
+        print(f"  DR         : DR{dr['dr_value']} ({dr['dr_db']:.2f} dB) [{src_label}]")
+        print(f"  Window     : {dr['block_seconds']:.1f}s blocks, top {int(dr['top_fraction']*100)}% RMS")
+
     # Short-term analysis results
     if results['windowed_analysis'] is not None:
         wa = results['windowed_analysis']
@@ -437,6 +553,8 @@ if __name__ == "__main__":
         print("  --no-true-peak: Disable True Peak calculation")
         print("  --no-windowed: Disable short-term window analysis")
         print("  --no-lufs: Disable LUFS loudness analysis")
+        print("  --pmf-dr: Calculate PMF Dynamic Range (TT DR-style, Sample Peak)")
+        print("  --pmf-dr-mk2: Calculate PMF Dynamic Range using True Peak (MkII-style)")
         print("  --no-parallel: Disable parallel processing")
         print("  --benchmark: Show performance benchmark information")
         print("  --check-deps: Check dependencies and FFmpeg availability")
@@ -470,19 +588,41 @@ if __name__ == "__main__":
     enable_true_peak = "--no-true-peak" not in sys.argv
     enable_windowed = "--no-windowed" not in sys.argv
     enable_lufs = "--no-lufs" not in sys.argv
+    enable_pmf_dr = ("--pmf-dr" in sys.argv) or ("--pmf-dr-mk2" in sys.argv)
+    pmf_dr_use_true_peak = "--pmf-dr-mk2" in sys.argv
     use_parallel = "--no-parallel" not in sys.argv
     show_benchmark = "--benchmark" in sys.argv
     
     if simple_mode:
         # Compatible mode: use original simple output
-        peak, rms, crest_db = crest_factor_db(file_path)
-        if peak is None:
-            print("Audio file is invalid or contains only silence")
+        if enable_pmf_dr:
+            # Minimal analysis required for PMF DR (needs full read anyway)
+            results = advanced_crest_analysis(
+                file_path,
+                enable_true_peak=pmf_dr_use_true_peak and enable_true_peak,
+                enable_windowed=False,
+                enable_lufs=False,
+                enable_pmf_dr=True,
+                pmf_dr_use_true_peak=pmf_dr_use_true_peak,
+                use_parallel=False,
+            )
+            if results is None or results.get('pmf_dr') is None:
+                print("Audio file is invalid or contains only silence")
+            else:
+                dr = results['pmf_dr']
+                peak_src = results.get('pmf_dr_peak_source', 'unknown')
+                algo = "PMF DR MkII (True Peak)" if peak_src == "true_peak" else "PMF DR (Sample Peak)"
+                print(f"File: {file_path}")
+                print(f"{algo}: DR{dr['dr_value']} ({dr['dr_db']:.2f} dB)")
         else:
-            print(f"File: {file_path}")
-            print(f"Peak: {peak:.6f}")
-            print(f"RMS: {rms:.6f}")
-            print(f"Crest Factor: {crest_db:.2f} dB")
+            peak, rms, crest_db = crest_factor_db(file_path)
+            if peak is None:
+                print("Audio file is invalid or contains only silence")
+            else:
+                print(f"File: {file_path}")
+                print(f"Peak: {peak:.6f}")
+                print(f"RMS: {rms:.6f}")
+                print(f"Crest Factor: {crest_db:.2f} dB")
     else:
         # Enhanced mode: use full analysis
         if show_benchmark:
@@ -493,13 +633,29 @@ if __name__ == "__main__":
             
             # Test serial version
             start_time = time.time()
-            results_serial = advanced_crest_analysis(file_path, enable_true_peak, enable_windowed, enable_lufs, use_parallel=False)
+            results_serial = advanced_crest_analysis(
+                file_path,
+                enable_true_peak,
+                enable_windowed,
+                enable_lufs,
+                enable_pmf_dr=enable_pmf_dr,
+                pmf_dr_use_true_peak=pmf_dr_use_true_peak,
+                use_parallel=False,
+            )
             serial_time = time.time() - start_time
             
             if use_parallel:
                 # Test parallel version
                 start_time = time.time()
-                results_parallel = advanced_crest_analysis(file_path, enable_true_peak, enable_windowed, enable_lufs, use_parallel=True)
+                results_parallel = advanced_crest_analysis(
+                    file_path,
+                    enable_true_peak,
+                    enable_windowed,
+                    enable_lufs,
+                    enable_pmf_dr=enable_pmf_dr,
+                    pmf_dr_use_true_peak=pmf_dr_use_true_peak,
+                    use_parallel=True,
+                )
                 parallel_time = time.time() - start_time
                 
                 print(f"Serial Processing Time: {serial_time:.3f} seconds")
@@ -512,7 +668,15 @@ if __name__ == "__main__":
         else:
             # Normal mode
             start_time = time.time()
-            results = advanced_crest_analysis(file_path, enable_true_peak, enable_windowed, enable_lufs, use_parallel)
+            results = advanced_crest_analysis(
+                file_path,
+                enable_true_peak,
+                enable_windowed,
+                enable_lufs,
+                enable_pmf_dr=enable_pmf_dr,
+                pmf_dr_use_true_peak=pmf_dr_use_true_peak,
+                use_parallel=use_parallel,
+            )
             end_time = time.time()
             
             if use_parallel:
