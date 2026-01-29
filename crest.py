@@ -1,6 +1,6 @@
 import sys
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 import multiprocessing as mp
 import time
@@ -13,7 +13,7 @@ from pathlib import Path
 import math
 import io
 import contextlib
-from concurrent.futures import as_completed
+import re
 
 try:
     import numpy as np
@@ -93,11 +93,20 @@ def ffmpeg_audio_analysis(file_path):
             'integrated_lufs': None,
             'loudness_range': None,
             'true_peak_dbfs': None,
+            'true_peak_dbfs_per_channel': None,
             'sample_peak_dbfs': None
         }
         
         # Find key information in Summary section
         in_summary = False
+        per_channel_true_peaks = {}
+        # Examples seen in the wild may include:
+        #   "Peak:        -0.1 dBFS"
+        #   "True peak:   -0.1 dBFS"
+        #   "True peak:  -0.1 dBFS (ch=1)"
+        #   "True peak:  -0.1 dBFS (L)" / "(R)"
+        tp_regex = re.compile(r"^(True\s*peak|Peak):\s*([+-]?\d+(?:\.\d+)?)\s*dBFS", re.IGNORECASE)
+        ch_regex = re.compile(r"\(.*?(?:ch\s*=\s*(\d+)|([LR]))\s*\)", re.IGNORECASE)
         for line in output_lines:
             line = line.strip()
             
@@ -127,15 +136,37 @@ def ffmpeg_audio_analysis(file_path):
                     except (ValueError, IndexError):
                         pass
                 
-                # Parse True peak
-                elif line.startswith('Peak:') and 'dBFS' in line:
+                # Parse (True) peak lines (overall and per-channel if present)
+                elif ('dBFS' in line) and (line.lower().startswith('peak') or line.lower().startswith('true')):
+                    m = tp_regex.match(line)
+                    if not m:
+                        continue
+                    label = m.group(1).lower().replace(" ", "")
                     try:
-                        # Format: "Peak:       -0.1 dBFS"
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            analysis_results['true_peak_dbfs'] = float(parts[1])
-                    except (ValueError, IndexError):
-                        pass
+                        value = float(m.group(2))
+                    except Exception:
+                        continue
+
+                    if label.startswith("true"):
+                        # Track overall max true peak
+                        if analysis_results['true_peak_dbfs'] is None or value > analysis_results['true_peak_dbfs']:
+                            analysis_results['true_peak_dbfs'] = value
+                        # Attempt to capture per-channel true peak if annotated
+                        chm = ch_regex.search(line)
+                        if chm:
+                            if chm.group(1):
+                                ch_idx = int(chm.group(1)) - 1
+                                per_channel_true_peaks[ch_idx] = max(per_channel_true_peaks.get(ch_idx, -1e9), value)
+                            elif chm.group(2):
+                                ch_key = chm.group(2).upper()
+                                per_channel_true_peaks[ch_key] = max(per_channel_true_peaks.get(ch_key, -1e9), value)
+                    else:
+                        # "Peak:" may be sample peak in some outputs; keep for completeness.
+                        if analysis_results['sample_peak_dbfs'] is None or value > analysis_results['sample_peak_dbfs']:
+                            analysis_results['sample_peak_dbfs'] = value
+
+        if per_channel_true_peaks:
+            analysis_results["true_peak_dbfs_per_channel"] = per_channel_true_peaks
         
         return analysis_results
         
@@ -387,6 +418,7 @@ def calculate_pmf_dr_v2(
     samplerate,
     peak_linear,
     block_seconds=3.0,
+    hop_seconds=0.01,
     top_fraction=0.2,
     rounding="nearest",
     channel_mode="per_channel",
@@ -415,14 +447,24 @@ def calculate_pmf_dr_v2(
     block_len = int(round(block_seconds * samplerate))
     if block_len <= 0:
         return None
+    hop_len = int(round(hop_seconds * samplerate))
+    if hop_len <= 0:
+        hop_len = 1
 
     total_samples = data.shape[0]
-    num_blocks = total_samples // block_len
-    if num_blocks <= 0:
+    if total_samples < block_len:
         return None
+    window_starts = np.arange(0, total_samples - block_len + 1, hop_len, dtype=np.int64)
+    if window_starts.size <= 0:
+        return None
+    num_windows = int(window_starts.size)
 
-    trimmed = data[: num_blocks * block_len, :]
-    blocks = trimmed.reshape(num_blocks, block_len, data.shape[1])
+    # Rolling RMS via cumulative sum of squares for efficiency (no huge window views)
+    squares = data.astype(np.float64, copy=False) ** 2
+    cs = np.vstack([np.zeros((1, channels), dtype=np.float64), np.cumsum(squares, axis=0)])
+    window_sums = cs[window_starts + block_len, :] - cs[window_starts, :]
+    mean_power_per_window_per_channel = window_sums / float(block_len)  # (num_windows, channels)
+    rms_per_window_per_channel = np.sqrt(mean_power_per_window_per_channel)
 
     if channel_mode not in ("per_channel", "mix"):
         raise ValueError(f"Unknown channel_mode: {channel_mode}")
@@ -437,19 +479,16 @@ def calculate_pmf_dr_v2(
     if channel_mode == "mix":
         if peak_linear is None or float(peak_linear) <= 0:
             return None
-
-        power_per_sample = np.mean(blocks ** 2, axis=2)
-        mean_power_per_block = np.mean(power_per_sample, axis=1)
-        rms_per_block = np.sqrt(mean_power_per_block)
-
-        valid = rms_per_block > 0
+        # Mixdown RMS: power-average across channels
+        rms_per_window_mix = np.sqrt(np.mean(mean_power_per_window_per_channel, axis=1))
+        valid = rms_per_window_mix > 0
         if not np.any(valid):
             return None
-        rms_per_block = rms_per_block[valid]
+        rms_per_window_mix = rms_per_window_mix[valid]
 
-        count = int(np.ceil(top_fraction * len(rms_per_block)))
-        count = max(1, min(count, len(rms_per_block)))
-        top_rms = np.sort(rms_per_block)[-count:]
+        count = int(np.ceil(top_fraction * len(rms_per_window_mix)))
+        count = max(1, min(count, len(rms_per_window_mix)))
+        top_rms = np.sort(rms_per_window_mix)[-count:]
         top_rms_mean = float(np.mean(top_rms))
         if top_rms_mean <= 0:
             return None
@@ -460,9 +499,10 @@ def calculate_pmf_dr_v2(
             "dr_db": dr_db,
             "dr_value": dr_value,
             "block_seconds": float(block_seconds),
+            "hop_seconds": float(hop_seconds),
             "top_fraction": float(top_fraction),
             "top_rms_mean": top_rms_mean,
-            "num_blocks": int(num_blocks),
+            "num_windows": int(num_windows),
             "channel_mode": "mix",
         }
 
@@ -481,26 +521,23 @@ def calculate_pmf_dr_v2(
     if np.any(peak_arr <= 0):
         return None
 
-    mean_power_per_block_per_channel = np.mean(blocks ** 2, axis=1)  # (num_blocks, channels)
-    rms_per_block_per_channel = np.sqrt(mean_power_per_block_per_channel)
-
     channel_results = []
     dr_values = []
     dr_dbs = []
 
     for ch in range(channels):
-        rms_blocks = rms_per_block_per_channel[:, ch]
-        valid = rms_blocks > 0
+        rms_windows = rms_per_window_per_channel[:, ch]
+        valid = rms_windows > 0
         if not np.any(valid):
             channel_results.append(
                 {"channel": int(ch), "dr_db": None, "dr_value": None, "top_rms_mean": None}
             )
             continue
-        rms_blocks = rms_blocks[valid]
+        rms_windows = rms_windows[valid]
 
-        count = int(np.ceil(top_fraction * len(rms_blocks)))
-        count = max(1, min(count, len(rms_blocks)))
-        top_rms = np.sort(rms_blocks)[-count:]
+        count = int(np.ceil(top_fraction * len(rms_windows)))
+        count = max(1, min(count, len(rms_windows)))
+        top_rms = np.sort(rms_windows)[-count:]
         top_rms_mean = float(np.mean(top_rms))
         if top_rms_mean <= 0:
             channel_results.append(
@@ -527,8 +564,9 @@ def calculate_pmf_dr_v2(
         "dr_db": track_dr_db,
         "dr_value": track_dr_value,
         "block_seconds": float(block_seconds),
+        "hop_seconds": float(hop_seconds),
         "top_fraction": float(top_fraction),
-        "num_blocks": int(num_blocks),
+        "num_windows": int(num_windows),
         "channel_mode": "per_channel",
         "channels": int(channels),
         "per_channel": channel_results,
@@ -566,6 +604,7 @@ def advanced_crest_analysis(
     pmf_dr_use_true_peak=False,
     pmf_dr_per_channel=True,
     pmf_dr_block_seconds=3.0,
+    pmf_dr_hop_seconds=0.01,
     pmf_dr_top_fraction=0.2,
     pmf_dr_rounding="nearest",
     use_parallel=True,
@@ -586,12 +625,15 @@ def advanced_crest_analysis(
             else:
                 data = data.astype(np.float32)
         
-        # Remove DC offset
+        data_raw = data
+
+        # Remove DC offset (keep raw for PMF DR alignment with TT tools)
         data = remove_dc_offset(data)
         
         # Basic calculations (always required) - vectorized optimization
         sample_peak = np.max(np.abs(data))
         sample_peak_per_channel = np.max(np.abs(data), axis=0) if data.shape[1] > 1 else np.array([sample_peak], dtype=np.float64)
+        sample_peak_per_channel_raw = np.max(np.abs(data_raw), axis=0) if data_raw.shape[1] > 1 else np.array([np.max(np.abs(data_raw))], dtype=np.float64)
         
         # Calculate RMS (vectorized optimization)
         if data.shape[1] > 1:
@@ -671,23 +713,46 @@ def advanced_crest_analysis(
         pmf_dr = None
         pmf_dr_peak_source = None
         if enable_pmf_dr:
+            pmf_data = data_raw
             dr_peak_linear = None
             if pmf_dr_use_true_peak:
                 if true_peak is not None:
-                    dr_peak_linear = true_peak
-                    pmf_dr_peak_source = "true_peak"
+                    if pmf_dr_per_channel and ffmpeg_results and ffmpeg_results.get("true_peak_dbfs_per_channel"):
+                        # Use per-channel true peaks if FFmpeg annotated them; fall back to global true peak otherwise.
+                        per = ffmpeg_results.get("true_peak_dbfs_per_channel") or {}
+                        tp_ch = []
+                        # Support either numeric (0-based) or "L"/"R" keys from parsing.
+                        for ch in range(int(pmf_data.shape[1])):
+                            if ch in per:
+                                tp_ch.append(convert_dbfs_to_linear(per[ch]))
+                            elif ch == 0 and "L" in per:
+                                tp_ch.append(convert_dbfs_to_linear(per["L"]))
+                            elif ch == 1 and "R" in per:
+                                tp_ch.append(convert_dbfs_to_linear(per["R"]))
+                            else:
+                                tp_ch.append(None)
+                        if all(v is not None and v > 0 for v in tp_ch):
+                            dr_peak_linear = np.array(tp_ch, dtype=np.float64)
+                            pmf_dr_peak_source = "true_peak_per_channel"
+                        else:
+                            dr_peak_linear = true_peak
+                            pmf_dr_peak_source = "true_peak"
+                    else:
+                        dr_peak_linear = true_peak
+                        pmf_dr_peak_source = "true_peak"
                 else:
-                    dr_peak_linear = sample_peak_per_channel if pmf_dr_per_channel else sample_peak
+                    dr_peak_linear = sample_peak_per_channel_raw if pmf_dr_per_channel else np.max(np.abs(pmf_data))
                     pmf_dr_peak_source = "sample_peak_fallback"
             else:
-                dr_peak_linear = sample_peak_per_channel if pmf_dr_per_channel else sample_peak
+                dr_peak_linear = sample_peak_per_channel_raw if pmf_dr_per_channel else np.max(np.abs(pmf_data))
                 pmf_dr_peak_source = "sample_peak"
 
             pmf_dr = calculate_pmf_dr_v2(
-                data,
+                pmf_data,
                 samplerate,
                 dr_peak_linear,
                 block_seconds=pmf_dr_block_seconds,
+                hop_seconds=pmf_dr_hop_seconds,
                 top_fraction=pmf_dr_top_fraction,
                 rounding=pmf_dr_rounding,
                 channel_mode=("per_channel" if pmf_dr_per_channel else "mix"),
@@ -877,6 +942,8 @@ def write_album_summary_csv(directory, rows, output_name="crest_album_summary.cs
         "pmf_dr_peak_source",
         "pmf_dr_channel_mode",
         "pmf_dr_channels",
+        "pmf_dr_window_s",
+        "pmf_dr_hop_s",
         "integrated_lufs_text",
         "lra_lu_text",
     ]
@@ -913,6 +980,7 @@ def analyze_album(
     enable_pmf_dr=False,
     pmf_dr_use_true_peak=False,
     pmf_dr_per_channel=True,
+    pmf_dr_hop_seconds=0.01,
     use_parallel=True,
     summary_name="crest_album_summary.csv",
     album_jobs=1,
@@ -988,6 +1056,7 @@ def analyze_album(
                     enable_pmf_dr=enable_pmf_dr,
                     pmf_dr_use_true_peak=pmf_dr_use_true_peak,
                     pmf_dr_per_channel=pmf_dr_per_channel,
+                    pmf_dr_hop_seconds=pmf_dr_hop_seconds,
                     use_parallel=internal_parallel,
                 )
                 if results is None:
@@ -1012,6 +1081,8 @@ def analyze_album(
                 pmf_dr_channel_mode = dr.get("channel_mode") if isinstance(dr, dict) else None
                 per_channel_vals = dr.get("per_channel_dr_values") if isinstance(dr, dict) else None
                 pmf_dr_channels = ",".join([str(v) for v in per_channel_vals]) if isinstance(per_channel_vals, list) else None
+                pmf_dr_window_s = dr.get("block_seconds") if isinstance(dr, dict) else None
+                pmf_dr_hop_s = dr.get("hop_seconds") if isinstance(dr, dict) else None
                 integrated_lufs = _safe_float(lufs.get("integrated_lufs")) if lufs.get("integrated_lufs") is not None else None
                 lra_lu = _safe_float(lufs.get("loudness_range")) if lufs.get("loudness_range") is not None else None
 
@@ -1037,6 +1108,8 @@ def analyze_album(
                     "pmf_dr_peak_source": results.get("pmf_dr_peak_source") if results.get("pmf_dr_peak_source") is not None else None,
                     "pmf_dr_channel_mode": pmf_dr_channel_mode,
                     "pmf_dr_channels": pmf_dr_channels,
+                    "pmf_dr_window_s": _safe_float(pmf_dr_window_s),
+                    "pmf_dr_hop_s": _safe_float(pmf_dr_hop_s),
                     "integrated_lufs": integrated_lufs,
                     "integrated_lufs_text": (_fmt_db(integrated_lufs, "LUFS", fmt=".1f") if integrated_lufs is not None else None),
                     "lra_lu": lra_lu,
@@ -1126,6 +1199,7 @@ if __name__ == "__main__":
         print("  --pmf-dr-mk2: Calculate PMF Dynamic Range using True Peak (MkII-style)")
         print("  --pmf-dr-per-channel: TT-style channel handling (default)")
         print("  --pmf-dr-mix: Mixdown channel handling (legacy)")
+        print("  --pmf-dr-hop S: Hop size in seconds for top-20% RMS sampling (default 0.01)")
         print("  --album <dir>: Analyze all audio files in a directory")
         print("  --recursive: When using --album, scan subdirectories too")
         print("  --album-jobs N: Song parallelism for --album (default 1)")
@@ -1171,6 +1245,17 @@ if __name__ == "__main__":
         except Exception:
             print("Error: --album-jobs requires an integer argument")
             sys.exit(2)
+
+    pmf_dr_hop_seconds = 0.01
+    if "--pmf-dr-hop" in sys.argv:
+        try:
+            pmf_dr_hop_seconds = float(sys.argv[sys.argv.index("--pmf-dr-hop") + 1])
+        except Exception:
+            print("Error: --pmf-dr-hop requires a numeric argument (seconds)")
+            sys.exit(2)
+        if pmf_dr_hop_seconds <= 0:
+            print("Error: --pmf-dr-hop must be > 0")
+            sys.exit(2)
     
     file_path = None if album_dir else sys.argv[1]
     
@@ -1203,6 +1288,7 @@ if __name__ == "__main__":
             enable_pmf_dr=enable_pmf_dr,
             pmf_dr_use_true_peak=pmf_dr_use_true_peak,
             pmf_dr_per_channel=pmf_dr_per_channel,
+            pmf_dr_hop_seconds=pmf_dr_hop_seconds,
             use_parallel=use_parallel,
             album_jobs=album_jobs,
         )
@@ -1220,6 +1306,7 @@ if __name__ == "__main__":
                 enable_pmf_dr=True,
                 pmf_dr_use_true_peak=pmf_dr_use_true_peak,
                 pmf_dr_per_channel=pmf_dr_per_channel,
+                pmf_dr_hop_seconds=pmf_dr_hop_seconds,
                 use_parallel=False,
             )
             if results is None or results.get('pmf_dr') is None:
@@ -1257,6 +1344,7 @@ if __name__ == "__main__":
                 enable_pmf_dr=enable_pmf_dr,
                 pmf_dr_use_true_peak=pmf_dr_use_true_peak,
                 pmf_dr_per_channel=pmf_dr_per_channel,
+                pmf_dr_hop_seconds=pmf_dr_hop_seconds,
                 use_parallel=False,
             )
             serial_time = time.time() - start_time
@@ -1272,6 +1360,7 @@ if __name__ == "__main__":
                     enable_pmf_dr=enable_pmf_dr,
                     pmf_dr_use_true_peak=pmf_dr_use_true_peak,
                     pmf_dr_per_channel=pmf_dr_per_channel,
+                    pmf_dr_hop_seconds=pmf_dr_hop_seconds,
                     use_parallel=True,
                 )
                 parallel_time = time.time() - start_time
@@ -1294,6 +1383,7 @@ if __name__ == "__main__":
                 enable_pmf_dr=enable_pmf_dr,
                 pmf_dr_use_true_peak=pmf_dr_use_true_peak,
                 pmf_dr_per_channel=pmf_dr_per_channel,
+                pmf_dr_hop_seconds=pmf_dr_hop_seconds,
                 use_parallel=use_parallel,
             )
             end_time = time.time()
