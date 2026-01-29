@@ -1,6 +1,4 @@
 import sys
-import numpy as np
-import soundfile as sf
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -10,6 +8,17 @@ import subprocess
 import json
 import shutil
 import os
+from pathlib import Path
+
+try:
+    import numpy as np
+except ModuleNotFoundError:  # pragma: no cover
+    np = None
+
+try:
+    import soundfile as sf
+except ModuleNotFoundError:  # pragma: no cover
+    sf = None
 
 # Get CPU core count for parallelization
 CPU_COUNT = mp.cpu_count()
@@ -21,12 +30,33 @@ def check_ffmpeg():
 
 FFMPEG_AVAILABLE = check_ffmpeg()
 
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".wav",
+    ".wave",
+    ".flac",
+    ".aif",
+    ".aiff",
+    ".caf",
+    ".ogg",
+    ".opus",
+    ".mp3",
+    ".m4a",
+    ".mp4",
+    ".aac",
+    ".wma",
+    ".alac",
+}
+
 def lin2dbfs(x):
     """Convert linear amplitude to dBFS (decibels relative to full scale)"""
+    if np is None:
+        raise RuntimeError("Missing dependency: numpy (pip install numpy)")
     return 20 * np.log10(x) if x > 0 else -np.inf
 
 def remove_dc_offset(data):
     """Remove DC offset by subtracting the mean value from each channel"""
+    if np is None:
+        raise RuntimeError("Missing dependency: numpy (pip install numpy)")
     return data - np.mean(data, axis=0)
 
 def ffmpeg_audio_analysis(file_path):
@@ -108,6 +138,111 @@ def ffmpeg_audio_analysis(file_path):
         warnings.warn(f"FFmpeg analysis failed: {e}")
         return None
 
+def discover_audio_files(directory, recursive=False):
+    dir_path = Path(directory)
+    if not dir_path.exists() or not dir_path.is_dir():
+        raise ValueError(f"Not a directory: {directory}")
+
+    pattern = "**/*" if recursive else "*"
+    candidates = [p for p in dir_path.glob(pattern) if p.is_file()]
+    audio_files = [p for p in candidates if p.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS]
+    return sorted(audio_files)
+
+def ffprobe_audio_stream_info(file_path):
+    """Return (sample_rate, channels) for the first audio stream via ffprobe."""
+    if not FFMPEG_AVAILABLE:
+        return None, None
+
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a:0",
+        "-show_entries",
+        "stream=sample_rate,channels",
+        "-of",
+        "json",
+        file_path,
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except Exception:
+        return None, None
+
+    if result.returncode != 0 or not result.stdout:
+        return None, None
+
+    try:
+        payload = json.loads(result.stdout)
+        streams = payload.get("streams") or []
+        if not streams:
+            return None, None
+        stream = streams[0]
+        sr = int(stream.get("sample_rate")) if stream.get("sample_rate") else None
+        ch = int(stream.get("channels")) if stream.get("channels") else None
+        return sr, ch
+    except Exception:
+        return None, None
+
+def read_audio_any(file_path):
+    """
+    Read audio into float32 ndarray shape (samples, channels) and return (data, sample_rate).
+    Tries SoundFile first; falls back to FFmpeg decode for formats SoundFile can't handle.
+    """
+    if np is None:
+        raise RuntimeError("Missing dependency: numpy (pip install numpy)")
+    try:
+        if sf is None:
+            raise RuntimeError("Missing dependency: soundfile (pip install soundfile)")
+        data, samplerate = sf.read(file_path, always_2d=True)
+        return data, samplerate
+    except Exception:
+        if not FFMPEG_AVAILABLE:
+            raise
+
+    samplerate, channels = ffprobe_audio_stream_info(file_path)
+    if samplerate is None or channels is None or samplerate <= 0 or channels <= 0:
+        raise RuntimeError("Unable to probe audio stream info via ffprobe")
+
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-nostats",
+        "-i",
+        file_path,
+        "-f",
+        "f32le",
+        "-acodec",
+        "pcm_f32le",
+        "-",
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="ignore") if isinstance(result.stderr, (bytes, bytearray)) else str(result.stderr)
+        raise RuntimeError(f"FFmpeg decode failed: {stderr.strip()}")
+
+    audio = np.frombuffer(result.stdout, dtype=np.float32)
+    if audio.size == 0:
+        raise RuntimeError("FFmpeg decode returned no audio samples")
+
+    frames = audio.size // channels
+    if frames <= 0:
+        raise RuntimeError("FFmpeg decode produced insufficient samples for channel count")
+
+    audio = audio[: frames * channels].reshape(frames, channels)
+    return audio, samplerate
+
 def _calculate_window_crest(args):
     """Calculate Crest Factor for a single window (for parallelization)"""
     segment, sr, start_idx = args
@@ -122,6 +257,8 @@ def _calculate_window_crest(args):
 
 def frame_crest_analysis_vectorized(data, sr, win_ms=50, hop_ms=12.5):
     """Vectorized short-term window Crest Factor analysis - high-performance version"""
+    if np is None:
+        raise RuntimeError("Missing dependency: numpy (pip install numpy)")
     win_samples = int(sr * win_ms / 1000)
     hop_samples = int(sr * hop_ms / 1000)
     
@@ -212,6 +349,8 @@ def frame_crest_analysis(data, sr, win_ms=50, hop_ms=12.5, use_parallel=True):
 
 def convert_dbfs_to_linear(dbfs_value):
     """Convert dBFS value to linear amplitude"""
+    if np is None:
+        raise RuntimeError("Missing dependency: numpy (pip install numpy)")
     if dbfs_value is None:
         return None
     return 10 ** (dbfs_value / 20)
@@ -226,6 +365,8 @@ def calculate_pmf_dr(data, samplerate, peak_linear, block_seconds=3.0, top_fract
     - For multi-channel audio, RMS uses a power-average across channels per sample.
     - `peak_linear` should be a linear amplitude (sample peak or true peak).
     """
+    if np is None:
+        raise RuntimeError("Missing dependency: numpy (pip install numpy)")
     if data is None or samplerate is None or samplerate <= 0:
         return None
     if peak_linear is None or peak_linear <= 0:
@@ -316,9 +457,11 @@ def advanced_crest_analysis(
     use_parallel=True,
 ):
     """Advanced Crest Factor analysis - FFmpeg + vectorized optimization version"""
+    if np is None:
+        raise RuntimeError("Missing dependency: numpy (pip install numpy)")
     try:
         # Force read as 2D array to preserve multi-channel information
-        data, samplerate = sf.read(file_path, always_2d=True)
+        data, samplerate = read_audio_any(file_path)
         
         # Ensure data is float32 type and normalized
         if data.dtype != np.float32:
@@ -546,15 +689,184 @@ def crest_factor_db(file_path):
         return None, None, None
     return results['sample_peak'], results['rms'], results['sample_crest_db']
 
+def _safe_float(x):
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+def _safe_int(x):
+    try:
+        if x is None:
+            return None
+        return int(x)
+    except Exception:
+        return None
+
+def write_album_summary_csv(directory, rows, output_name="crest_album_summary.csv"):
+    raise RuntimeError("CSV summary is deprecated; use write_album_summary_json() instead.")
+
+def write_album_summary_json(directory, rows, output_name="crest_album_summary.json"):
+    out_path = Path(directory) / output_name
+    payload = {
+        "schema": "crest_calc_album_summary_v1",
+        "generated_by": "crest.py",
+        "directory": str(Path(directory)),
+        "file_count": int(len(rows)),
+        "rows": rows,
+    }
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return str(out_path)
+
+def analyze_album(
+    directory,
+    recursive=False,
+    simple_mode=False,
+    enable_true_peak=True,
+    enable_windowed=True,
+    enable_lufs=True,
+    enable_pmf_dr=False,
+    pmf_dr_use_true_peak=False,
+    use_parallel=True,
+    summary_name="crest_album_summary.json",
+):
+    files = discover_audio_files(directory, recursive=recursive)
+    if not files:
+        print(f"No supported audio files found in: {directory}")
+        return None
+
+    print(f"Found {len(files)} audio file(s) in: {directory}")
+    summary_rows = []
+
+    for idx, path in enumerate(files, start=1):
+        file_path = str(path)
+        print(f"\n[{idx}/{len(files)}] {file_path}")
+        try:
+            if simple_mode and not enable_pmf_dr:
+                peak, rms, crest_db = crest_factor_db(file_path)
+                if peak is None:
+                    print("Audio file is invalid or contains only silence")
+                    summary_rows.append(
+                        {
+                            "file": file_path,
+                            "status": "error",
+                            "error": "invalid_or_silent",
+                        }
+                    )
+                    continue
+
+                print(f"File: {file_path}")
+                print(f"Peak: {peak:.6f}")
+                print(f"RMS: {rms:.6f}")
+                print(f"Crest Factor: {crest_db:.2f} dB")
+
+                summary_rows.append(
+                    {
+                        "file": file_path,
+                        "status": "ok",
+                        "error": "",
+                        "duration_s": "",
+                        "sample_rate_hz": "",
+                        "channels": "",
+                        "sample_peak_dbfs": lin2dbfs(peak),
+                        "true_peak_dbfs": "",
+                        "sample_crest_db": crest_db,
+                        "true_crest_db": "",
+                        "pmf_dr": "",
+                        "pmf_dr_db": "",
+                        "pmf_dr_peak_source": "",
+                        "integrated_lufs": "",
+                        "lra_lu": "",
+                    }
+                )
+                continue
+
+            results = advanced_crest_analysis(
+                file_path,
+                enable_true_peak=enable_true_peak,
+                enable_windowed=enable_windowed,
+                enable_lufs=enable_lufs,
+                enable_pmf_dr=enable_pmf_dr,
+                pmf_dr_use_true_peak=pmf_dr_use_true_peak,
+                use_parallel=use_parallel,
+            )
+            if results is None:
+                print("Analysis failed or audio file is invalid")
+                summary_rows.append(
+                    {
+                        "file": file_path,
+                        "status": "error",
+                        "error": "analysis_failed_or_invalid",
+                    }
+                )
+                continue
+
+            print_analysis_results(results)
+
+            lufs = results.get("lufs_analysis") or {}
+            dr = results.get("pmf_dr") or {}
+
+            summary_rows.append(
+                {
+                    "file": file_path,
+                    "status": "ok",
+                    "error": "",
+                    "duration_s": _safe_float(results.get("duration")),
+                    "sample_rate_hz": _safe_int(results.get("sample_rate")),
+                    "channels": _safe_int(results.get("channels")),
+                    "sample_peak_dbfs": lin2dbfs(results.get("sample_peak")) if results.get("sample_peak") is not None else "",
+                    "true_peak_dbfs": results.get("true_peak_dbfs") if results.get("true_peak_dbfs") is not None else "",
+                    "sample_crest_db": results.get("sample_crest_db") if results.get("sample_crest_db") is not None else "",
+                    "true_crest_db": results.get("true_crest_db") if results.get("true_crest_db") is not None else "",
+                    "pmf_dr": dr.get("dr_value") if dr.get("dr_value") is not None else "",
+                    "pmf_dr_db": dr.get("dr_db") if dr.get("dr_db") is not None else "",
+                    "pmf_dr_peak_source": results.get("pmf_dr_peak_source") if results.get("pmf_dr_peak_source") is not None else "",
+                    "integrated_lufs": lufs.get("integrated_lufs") if lufs.get("integrated_lufs") is not None else "",
+                    "lra_lu": lufs.get("loudness_range") if lufs.get("loudness_range") is not None else "",
+                }
+            )
+        except Exception as e:
+            print(f"Error processing file {file_path}: {e}")
+            summary_rows.append(
+                {
+                    "file": file_path,
+                    "status": "error",
+                    "error": str(e),
+                }
+            )
+
+    out_path = write_album_summary_json(directory, summary_rows, output_name=summary_name)
+    print(f"\nSummary written to: {out_path}")
+    return out_path
+
 if __name__ == "__main__":
+    if np is None or sf is None:
+        if "--check-deps" not in sys.argv:
+            missing = []
+            if np is None:
+                missing.append("numpy")
+            if sf is None:
+                missing.append("soundfile")
+            print(f"Missing Python dependencies: {', '.join(missing)}")
+            print("Install with: pip install numpy soundfile")
+            sys.exit(2)
+
     if len(sys.argv) < 2:
-        print("Usage: python crest.py <audio_file> [options] or python crest.py --check-deps")
+        print("Usage: python crest.py <audio_file> [options]")
+        print("       python crest.py --album <directory> [options]")
+        print("       python crest.py --check-deps")
         print("  --simple: Use simple mode (backward compatible output)")
         print("  --no-true-peak: Disable True Peak calculation")
         print("  --no-windowed: Disable short-term window analysis")
         print("  --no-lufs: Disable LUFS loudness analysis")
         print("  --pmf-dr: Calculate PMF Dynamic Range (TT DR-style, Sample Peak)")
         print("  --pmf-dr-mk2: Calculate PMF Dynamic Range using True Peak (MkII-style)")
+        print("  --album <dir>: Analyze all audio files in a directory")
+        print("  --recursive: When using --album, scan subdirectories too")
         print("  --no-parallel: Disable parallel processing")
         print("  --benchmark: Show performance benchmark information")
         print("  --check-deps: Check dependencies and FFmpeg availability")
@@ -563,8 +875,8 @@ if __name__ == "__main__":
     # Check special commands
     if "--check-deps" in sys.argv:
         print("🔧 Dependency Check:")
-        print(f"  NumPy: ✅")
-        print(f"  SoundFile: ✅")
+        print(f"  NumPy: {'✅' if np is not None else '❌ Missing'}")
+        print(f"  SoundFile: {'✅' if sf is not None else '❌ Missing'}")
         print(f"  FFmpeg: {'✅ Available' if FFMPEG_AVAILABLE else '❌ Unavailable'}")
         if FFMPEG_AVAILABLE:
             try:
@@ -581,7 +893,16 @@ if __name__ == "__main__":
         print(f"  CPU Cores: {CPU_COUNT}")
         sys.exit(0)
     
-    file_path = sys.argv[1]
+    album_dir = None
+    recursive_album = "--recursive" in sys.argv
+    if "--album" in sys.argv:
+        try:
+            album_dir = sys.argv[sys.argv.index("--album") + 1]
+        except Exception:
+            print("Error: --album requires a directory argument")
+            sys.exit(2)
+    
+    file_path = None if album_dir else sys.argv[1]
     
     # Parse command line arguments
     simple_mode = "--simple" in sys.argv
@@ -592,6 +913,23 @@ if __name__ == "__main__":
     pmf_dr_use_true_peak = "--pmf-dr-mk2" in sys.argv
     use_parallel = "--no-parallel" not in sys.argv
     show_benchmark = "--benchmark" in sys.argv
+
+    if album_dir:
+        if show_benchmark:
+            print("Note: --benchmark is ignored when using --album")
+
+        analyze_album(
+            album_dir,
+            recursive=recursive_album,
+            simple_mode=simple_mode,
+            enable_true_peak=enable_true_peak,
+            enable_windowed=enable_windowed,
+            enable_lufs=enable_lufs,
+            enable_pmf_dr=enable_pmf_dr,
+            pmf_dr_use_true_peak=pmf_dr_use_true_peak,
+            use_parallel=use_parallel,
+        )
+        sys.exit(0)
     
     if simple_mode:
         # Compatible mode: use original simple output

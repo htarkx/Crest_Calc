@@ -51,6 +51,12 @@ pip install numpy soundfile
 # Full analysis with all features
 python crest.py audio_file.wav
 
+# Analyze a whole directory (album)
+python crest.py --album /path/to/album
+#
+# Writes a summary file into the directory:
+#   crest_album_summary.json
+
 # Simple mode (backward compatibility)
 python crest.py audio_file.wav --simple
 
@@ -69,6 +75,10 @@ python crest.py audio_file.wav --no-true-peak --no-windowed --no-lufs
 # PMF Dynamic Range (TT DR-style)
 python crest.py audio_file.wav --pmf-dr          # Sample Peak
 python crest.py audio_file.wav --pmf-dr-mk2      # True Peak (requires FFmpeg for True Peak)
+
+# Album mode options
+python crest.py --album /path/to/album --recursive
+python crest.py --album /path/to/album --pmf-dr-mk2
 
 # Disable parallel processing
 python crest.py audio_file.wav --no-parallel
