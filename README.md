@@ -55,6 +55,7 @@ python crest.py audio_file.wav
 python crest.py --album /path/to/album
 #
 # Writes a summary file into the directory:
+#   crest_album_summary.csv
 #   crest_album_summary.json
 
 # Simple mode (backward compatibility)
@@ -78,7 +79,12 @@ python crest.py audio_file.wav --pmf-dr-mk2      # True Peak (requires FFmpeg fo
 
 # Album mode options
 python crest.py --album /path/to/album --recursive
-python crest.py --album /path/to/album --pmf-dr-mk2
+python crest.py --album /path/to/album --album-jobs 4
+
+# PMF DR matching / experimentation
+python crest.py audio_file.wav --pmf-dr-hop 0.01
+python crest.py audio_file.wav --pmf-dr-rms iir --pmf-dr-tau 3.0
+python crest.py audio_file.wav --pmf-dr-compare
 
 # Disable parallel processing
 python crest.py audio_file.wav --no-parallel
@@ -109,7 +115,8 @@ Duration: 3.45 seconds
 
 📏 PMF Dynamic Range (TT DR-style):
   DR         : DR8 (7.62 dB) [True Peak]
-  Window     : 3.0s blocks, top 20% RMS
+  Window     : 3.0s blocks, hop=0.0100s, rms=rect, top 20% RMS
+  Top20 RMS  : -7.62 dBFS
 
 🔍 Short-term Window Analysis (50ms windows):
   Mean CF    : 11.23 dB
@@ -122,6 +129,17 @@ Duration: 3.45 seconds
   Integrated: -23.4 LUFS
   LRA       : 8.0 LU
 ```
+
+## 🔁 TT DR Meter Compatibility Notes
+
+This project aims to be as close as practical to the classic TT DR (PMF) workflow (top-20% loudness statistics + peak), but there are still implementation details that can cause systematic offsets.
+
+- **RMS integration (ballistics) differences:** TT DR implementations may behave closer to an RMS ballistics / time-constant tracker than a pure rectangular sliding-window RMS. This tool supports both for verification:
+  - `--pmf-dr-rms rect` (rectangular sliding window)
+  - `--pmf-dr-rms iir --pmf-dr-tau 3.0` (IIR/EMA power tracking, τ-based)
+  - `--pmf-dr-compare` prints both results side-by-side.
+- **Sine calibration offset (~3 dB):** Some TT DR tooling/reporting applies an approx. **3 dB sine-wave compensation** (often described as aligning sine RMS vs peak conventions). If you want to compare against **DR Database / TT DR log “DR dB” style values**, you may need to **manually subtract ~3 dB** from this tool’s `dr_db` before comparing.
+- **Rounding amplifies small differences:** DR values are typically reported as integers (e.g. `DR8`). A small dB-level discrepancy in `top20 RMS` or peak handling can be **magnified after rounding**, resulting in a **±1 DR step** difference (“一个档位”).
 
 ## 🛠️ Technical Architecture
 
