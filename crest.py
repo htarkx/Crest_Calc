@@ -11,6 +11,9 @@ import os
 import csv
 from pathlib import Path
 import math
+import io
+import contextlib
+from concurrent.futures import as_completed
 
 try:
     import numpy as np
@@ -912,6 +915,7 @@ def analyze_album(
     pmf_dr_per_channel=True,
     use_parallel=True,
     summary_name="crest_album_summary.csv",
+    album_jobs=1,
 ):
     files = discover_audio_files(directory, recursive=recursive)
     if not files:
@@ -921,30 +925,31 @@ def analyze_album(
     print(f"Found {len(files)} audio file(s) in: {directory}")
     summary_rows = []
 
-    for idx, path in enumerate(files, start=1):
-        file_path = str(path)
-        print(f"\n[{idx}/{len(files)}] {file_path}")
-        try:
-            if simple_mode and not enable_pmf_dr:
-                peak, rms, crest_db = crest_factor_db(file_path)
-                if peak is None:
-                    print("Audio file is invalid or contains only silence")
-                    summary_rows.append(
-                        {
+    def _analyze_one(idx, path_obj):
+        file_path = str(path_obj)
+        buf = io.StringIO()
+        row = None
+
+        with contextlib.redirect_stdout(buf):
+            print(f"\n[{idx}/{len(files)}] {file_path}")
+            try:
+                if simple_mode and not enable_pmf_dr:
+                    peak, rms, crest_db = crest_factor_db(file_path)
+                    if peak is None:
+                        print("Audio file is invalid or contains only silence")
+                        row = {
                             "file": file_path,
                             "status": "error",
                             "error": "invalid_or_silent",
                         }
-                    )
-                    continue
+                        return file_path, buf.getvalue(), row
 
-                print(f"File: {file_path}")
-                print(f"Peak: {peak:.6f}")
-                print(f"RMS: {rms:.6f}")
-                print(f"Crest Factor: {crest_db:.2f} dB")
+                    print(f"File: {file_path}")
+                    print(f"Peak: {peak:.6f}")
+                    print(f"RMS: {rms:.6f}")
+                    print(f"Crest Factor: {crest_db:.2f} dB")
 
-                summary_rows.append(
-                    {
+                    row = {
                         "file": file_path,
                         "status": "ok",
                         "error": None,
@@ -960,56 +965,57 @@ def analyze_album(
                         "true_crest_db": None,
                         "true_crest_db_text": None,
                         "pmf_dr": None,
+                        "pmf_dr_value": None,
                         "pmf_dr_db": None,
                         "pmf_dr_db_text": None,
                         "pmf_dr_peak_source": None,
+                        "pmf_dr_channel_mode": None,
+                        "pmf_dr_channels": None,
                         "integrated_lufs": None,
                         "integrated_lufs_text": None,
                         "lra_lu": None,
                         "lra_lu_text": None,
                     }
-                )
-                continue
+                    return file_path, buf.getvalue(), row
 
-            results = advanced_crest_analysis(
-                file_path,
-                enable_true_peak=enable_true_peak,
-                enable_windowed=enable_windowed,
-                enable_lufs=enable_lufs,
-                enable_pmf_dr=enable_pmf_dr,
-                pmf_dr_use_true_peak=pmf_dr_use_true_peak,
-                pmf_dr_per_channel=pmf_dr_per_channel,
-                use_parallel=use_parallel,
-            )
-            if results is None:
-                print("Analysis failed or audio file is invalid")
-                summary_rows.append(
-                    {
+                # Avoid nested parallel oversubscription: if running songs in parallel, disable per-song task parallelism.
+                internal_parallel = use_parallel if album_jobs <= 1 else False
+                results = advanced_crest_analysis(
+                    file_path,
+                    enable_true_peak=enable_true_peak,
+                    enable_windowed=enable_windowed,
+                    enable_lufs=enable_lufs,
+                    enable_pmf_dr=enable_pmf_dr,
+                    pmf_dr_use_true_peak=pmf_dr_use_true_peak,
+                    pmf_dr_per_channel=pmf_dr_per_channel,
+                    use_parallel=internal_parallel,
+                )
+                if results is None:
+                    print("Analysis failed or audio file is invalid")
+                    row = {
                         "file": file_path,
                         "status": "error",
                         "error": "analysis_failed_or_invalid",
                     }
-                )
-                continue
+                    return file_path, buf.getvalue(), row
 
-            print_analysis_results(results)
+                print_analysis_results(results)
 
-            lufs = results.get("lufs_analysis") or {}
-            dr = results.get("pmf_dr") or {}
-            sample_peak_dbfs = _safe_float(lin2dbfs(results.get("sample_peak"))) if results.get("sample_peak") is not None else None
-            true_peak_dbfs = _safe_float(results.get("true_peak_dbfs")) if results.get("true_peak_dbfs") is not None else None
-            sample_crest_db = _safe_float(results.get("sample_crest_db")) if results.get("sample_crest_db") is not None else None
-            true_crest_db = _safe_float(results.get("true_crest_db")) if results.get("true_crest_db") is not None else None
-            pmf_dr_value = _safe_int(dr.get("dr_value")) if dr.get("dr_value") is not None else None
-            pmf_dr_db = _safe_float(dr.get("dr_db")) if dr.get("dr_db") is not None else None
-            pmf_dr_channel_mode = dr.get("channel_mode") if isinstance(dr, dict) else None
-            per_channel_vals = dr.get("per_channel_dr_values") if isinstance(dr, dict) else None
-            pmf_dr_channels = ",".join([str(v) for v in per_channel_vals]) if isinstance(per_channel_vals, list) else None
-            integrated_lufs = _safe_float(lufs.get("integrated_lufs")) if lufs.get("integrated_lufs") is not None else None
-            lra_lu = _safe_float(lufs.get("loudness_range")) if lufs.get("loudness_range") is not None else None
+                lufs = results.get("lufs_analysis") or {}
+                dr = results.get("pmf_dr") or {}
+                sample_peak_dbfs = _safe_float(lin2dbfs(results.get("sample_peak"))) if results.get("sample_peak") is not None else None
+                true_peak_dbfs = _safe_float(results.get("true_peak_dbfs")) if results.get("true_peak_dbfs") is not None else None
+                sample_crest_db = _safe_float(results.get("sample_crest_db")) if results.get("sample_crest_db") is not None else None
+                true_crest_db = _safe_float(results.get("true_crest_db")) if results.get("true_crest_db") is not None else None
+                pmf_dr_value = _safe_int(dr.get("dr_value")) if dr.get("dr_value") is not None else None
+                pmf_dr_db = _safe_float(dr.get("dr_db")) if dr.get("dr_db") is not None else None
+                pmf_dr_channel_mode = dr.get("channel_mode") if isinstance(dr, dict) else None
+                per_channel_vals = dr.get("per_channel_dr_values") if isinstance(dr, dict) else None
+                pmf_dr_channels = ",".join([str(v) for v in per_channel_vals]) if isinstance(per_channel_vals, list) else None
+                integrated_lufs = _safe_float(lufs.get("integrated_lufs")) if lufs.get("integrated_lufs") is not None else None
+                lra_lu = _safe_float(lufs.get("loudness_range")) if lufs.get("loudness_range") is not None else None
 
-            summary_rows.append(
-                {
+                row = {
                     "file": file_path,
                     "status": "ok",
                     "error": None,
@@ -1036,16 +1042,30 @@ def analyze_album(
                     "lra_lu": lra_lu,
                     "lra_lu_text": (_fmt_db(lra_lu, "LU", fmt=".1f") if lra_lu is not None else None),
                 }
-            )
-        except Exception as e:
-            print(f"Error processing file {file_path}: {e}")
-            summary_rows.append(
-                {
+                return file_path, buf.getvalue(), row
+            except Exception as e:
+                print(f"Error processing file {file_path}: {e}")
+                row = {
                     "file": file_path,
                     "status": "error",
                     "error": str(e),
                 }
-            )
+                return file_path, buf.getvalue(), row
+
+    jobs = max(1, min(int(album_jobs or 1), len(files)))
+    if jobs == 1:
+        for idx, path in enumerate(files, start=1):
+            _, out_text, row = _analyze_one(idx, path)
+            print(out_text, end="")
+            summary_rows.append(row)
+    else:
+        print(f"Album parallelism: {jobs} song(s) at a time")
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            futures = [executor.submit(_analyze_one, idx, path) for idx, path in enumerate(files, start=1)]
+            for fut in as_completed(futures):
+                _, out_text, row = fut.result()
+                print(out_text, end="")
+                summary_rows.append(row)
 
     ok_rows = [r for r in summary_rows if r.get("status") == "ok"]
     err_rows = [r for r in summary_rows if r.get("status") != "ok"]
@@ -1108,6 +1128,7 @@ if __name__ == "__main__":
         print("  --pmf-dr-mix: Mixdown channel handling (legacy)")
         print("  --album <dir>: Analyze all audio files in a directory")
         print("  --recursive: When using --album, scan subdirectories too")
+        print("  --album-jobs N: Song parallelism for --album (default 1)")
         print("  --no-parallel: Disable parallel processing")
         print("  --benchmark: Show performance benchmark information")
         print("  --check-deps: Check dependencies and FFmpeg availability")
@@ -1142,6 +1163,14 @@ if __name__ == "__main__":
         except Exception:
             print("Error: --album requires a directory argument")
             sys.exit(2)
+
+    album_jobs = 1
+    if "--album-jobs" in sys.argv:
+        try:
+            album_jobs = int(sys.argv[sys.argv.index("--album-jobs") + 1])
+        except Exception:
+            print("Error: --album-jobs requires an integer argument")
+            sys.exit(2)
     
     file_path = None if album_dir else sys.argv[1]
     
@@ -1175,6 +1204,7 @@ if __name__ == "__main__":
             pmf_dr_use_true_peak=pmf_dr_use_true_peak,
             pmf_dr_per_channel=pmf_dr_per_channel,
             use_parallel=use_parallel,
+            album_jobs=album_jobs,
         )
         sys.exit(0)
     
