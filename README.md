@@ -139,7 +139,7 @@ This project aims to be as close as practical to the classic TT DR (PMF) workflo
   - `--pmf-dr-rms iir --pmf-dr-tau 3.0` (IIR/EMA power tracking, τ-based)
   - `--pmf-dr-compare` prints both results side-by-side.
 - **Sine calibration offset (~3 dB):** Some TT DR tooling/reporting applies an approx. **3 dB sine-wave compensation** (often described as aligning sine RMS vs peak conventions). If you want to compare against **DR Database / TT DR log “DR dB” style values**, you may need to **manually subtract ~3 dB** from this tool’s `dr_db` before comparing.
-- **Rounding amplifies small differences:** DR values are typically reported as integers (e.g. `DR8`). A small dB-level discrepancy in `top20 RMS` or peak handling can be **magnified after rounding**, resulting in a **±1 DR step** difference (“一个档位”).
+- **Rounding amplifies small differences:** DR values are typically reported as integers (e.g. `DR8`). A small dB-level discrepancy in `top20 RMS` or peak handling can be **magnified after rounding**, resulting in a **±1 DR step** difference (i.e., “one DR step”).
 
 ## 🛠️ Technical Architecture
 

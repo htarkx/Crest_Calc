@@ -1,0 +1,8 @@
+# Default (album mode) DR measurement for a whole folder (PMF DR MkII / True Peak)
+python crest.py --album "/path/to/album"
+
+# If the album directory contains subfolders (e.g., CD1/CD2), scan recursively:
+python crest.py --album "/path/to/album" --recursive
+
+# If the current directory is the album directory:
+python crest.py --album .
